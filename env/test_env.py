@@ -20,5 +20,14 @@ for day in [1,2]:
         )
 
 df = pd.DataFrame(rows)
-print(df.head())
+
+env = KalshiBTCHourlyEnv(df,KalshiEnvConfig())
+
+obs, info = env.reset()
+done = False
+while not done:
+    action = env.action_space.sample()
+    obs,reward, terminated, truncated, info = env.step(action)
+    print("reward:", reward,"| info:",info)
+    done = terminated or truncated
 
