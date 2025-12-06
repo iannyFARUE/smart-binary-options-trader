@@ -3,6 +3,7 @@ import pandas as pd
 from stable_baselines3 import PPO
 from stable_baselines3.common.logger import configure
 
+
 from env.kalshi_env import KalshiBTCHourlyEnv, KalshiEnvConfig
 
 
@@ -29,7 +30,7 @@ def make_dummy_data():
     return pd.DataFrame(rows)
 
 
-def main():
+def train():
     data = make_dummy_data()
     config = KalshiEnvConfig()
 
@@ -59,7 +60,3 @@ def main():
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
     model.save(model_path)
     print(f"Saved model to {model_path}")
-
-
-if __name__ == "__main__":
-    main()

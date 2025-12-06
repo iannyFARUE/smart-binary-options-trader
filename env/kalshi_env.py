@@ -118,7 +118,7 @@ class KalshiBTCHourlyEnv(gym.Env):
         self.portfolio_value = self._compute_portfolio_value()
 
         obs = self._get_observation()
-        info = {"day": self.current_day, "t": self.t}
+        info = {"day": int(self.current_day), "t": int(self.t)}
         return obs, info
 
     def step(self, action: int):
