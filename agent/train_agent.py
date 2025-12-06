@@ -34,9 +34,11 @@ def make_dummy_data():
 def train():
         # 1. Load raw BTC minute data
     raw_path = "data/raw/btcusd_minute.csv"  # adjust to your actual file path
+    print("[train] Loading raw BTC data...")
     raw_df = load_raw_btc_data(raw_path)
 
     # 2. Build Kalshi-like hourly events
+    print("[train] Building hourly kalshi-like events...")
     events_df = build_hourly_kalshi_like_events(raw_df)
     print("Events df head:")
     print(events_df.head())
@@ -53,8 +55,8 @@ def train():
         "MlpPolicy",
         env,
         verbose=1,
-        n_steps=64,        # small for toy example
-        batch_size=64,
+        n_steps=256,        # small for toy example
+        batch_size=256,
         learning_rate=3e-4,
         gamma=0.99,
         ent_coef=0.01,
@@ -64,7 +66,7 @@ def train():
     # Train for a small number of steps just to see if it runs
     model.learn(total_timesteps=10_000)
 
-    model_path = "./agent/models/ppo_kalshi_dummy.zip"
+    model_path = "./agent/models/ppo_kalshi_realdata.zip"
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
     model.save(model_path)
-    print(f"Saved model to {model_path}")
+    print(f"[train] Saved model to {model_path}")

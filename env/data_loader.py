@@ -148,5 +148,3 @@ def build_hourly_kalshi_like_events(
     events_df = events_df[["day", "hour", "btc_price", "yes_price", "no_price", "outcome"]]
 
     return events_df
-
-    return events_df
