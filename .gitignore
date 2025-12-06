@@ -18,7 +18,7 @@ wheels/
 *.pth
 
 # Dataset
-data/
+data/raw/*
 
 .ipynb_checkpoints
 
