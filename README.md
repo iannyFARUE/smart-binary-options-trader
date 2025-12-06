@@ -11,3 +11,7 @@ One hourly contract
 ## Starting project
 
 `uv run main.py`
+
+# Dataset
+
+Used a public available bitcoin data at 1 minute interval dataset [Link](https://www.kaggle.com/datasets/mczielinski/bitcoin-historical-data)

@@ -2,6 +2,7 @@ import os
 import pandas as pd
 from stable_baselines3 import PPO
 from stable_baselines3.common.logger import configure
+from env.data_loader import load_raw_btc_data, build_hourly_kalshi_like_events
 
 
 from env.kalshi_env import KalshiBTCHourlyEnv, KalshiEnvConfig
@@ -31,10 +32,17 @@ def make_dummy_data():
 
 
 def train():
-    data = make_dummy_data()
+        # 1. Load raw BTC minute data
+    raw_path = "data/raw/btcusd_minute.csv"  # adjust to your actual file path
+    raw_df = load_raw_btc_data(raw_path)
+
+    # 2. Build Kalshi-like hourly events
+    events_df = build_hourly_kalshi_like_events(raw_df)
+    print("Events df head:")
+    print(events_df.head())
     config = KalshiEnvConfig()
 
-    env = KalshiBTCHourlyEnv(data, config)
+    env = KalshiBTCHourlyEnv(events_df, config)
 
     # Optional: set up logging dir for SB3
     log_dir = "./logs/ppo_kalshi/"
