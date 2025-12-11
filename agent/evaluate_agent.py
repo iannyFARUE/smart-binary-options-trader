@@ -64,7 +64,7 @@ def main():
     # Load data & environment
     from env.data_loader import load_raw_btc_data, build_hourly_kalshi_like_events
 
-    raw_path = "data/raw/btc_minute.csv"
+    raw_path = "data/raw/btcusd_minute.csv"
     raw_df = load_raw_btc_data(raw_path)
     events_df = build_hourly_kalshi_like_events(raw_df)
 
