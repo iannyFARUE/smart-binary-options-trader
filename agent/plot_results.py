@@ -155,7 +155,7 @@ def plot_boxplot(pnl_dict, out_path):
 
 def main():
     # 1. Load data & environment
-    raw_path = "data/raw/btc_minute.csv"
+    raw_path = "data/raw/btcusd_minute.csv"
     raw_df = load_raw_btc_data(raw_path)
     events_df = build_hourly_kalshi_like_events(raw_df)
 
