@@ -8,6 +8,7 @@ import requests
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
+from dotenv import load_dotenv
 
 
 class KalshiClient:
@@ -23,11 +24,12 @@ class KalshiClient:
         key_id: Optional[str] = None,
         private_key_path: Optional[str] = None,
     ):
+        load_dotenv()
         self.base_url = base_url or os.getenv(
             "KALSHI_DEMO_BASE_URL",
             "https://demo-api.kalshi.co/trade-api/v2",
         )
-        self.key_id = key_id or os.getenv("KALSHI_KEY_ID")
+        self.key_id = key_id or os.environ["KALSHI_API_KEY_ID"]
         self.private_key_path = private_key_path or os.getenv("KALSHI_PRIVATE_KEY_PATH")
 
         if not self.key_id:
