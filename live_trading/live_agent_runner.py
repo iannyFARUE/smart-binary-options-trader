@@ -155,6 +155,8 @@ def main():
                     "count",
                     "price",
                     "portfolio_value",
+                    "user_id",
+                    "order_id"
                 ]
             )
 
@@ -163,14 +165,14 @@ def main():
     while True:
         try:
             # 1) Fetch BTC hourly markets (adjust filter to match actual ticker symbol)
-            markets_resp = client.get_markets(ticker="BTC")
-            markets = markets_resp.get("markets", [])
+            markets_resp = client.get_markets(series_ticker="KXBTC",status="open")
+            btc_markets = markets_resp
 
             # Filter for relevant BTC hourly threshold markets, adjust this filter
-            btc_markets = [
-                m for m in markets
-                if "BTC" in m.get("underlying", "") or "BTC" in m.get("title", "")
-            ]
+            # btc_markets = [
+            #     m for m in markets
+            #     if "BTC" in m.get("underlying", "") or "BTC" in m.get("title", "")
+            # ]
 
             if not btc_markets:
                 print("[live] No BTC markets found, sleeping...")
@@ -259,6 +261,8 @@ def main():
                         contracts_per_trade,
                         price,
                         portfolio_value,
+                        order_resp.user_id,
+                        order_resp.order_id
                     ]
                 )
 

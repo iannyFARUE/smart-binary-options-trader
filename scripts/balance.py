@@ -22,3 +22,6 @@ def get_balance():
     balance = client.get_balance()
     print(f"Raw balcne response: {balance}")
     print(f"Cash balance: ${balance.balance / 100:.2f}")
+
+if __name__ == "__main__":
+    get_balance()

@@ -1,15 +1,21 @@
 # live_trading/kalshi_api.py
 import os
-import time
+import datetime
 import json
 from typing import Any, Dict, Optional
+from enum import Enum
 
 import requests
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
+from cryptography.hazmat.backends import default_backend
 from dotenv import load_dotenv
+import uuid
 
+class Environment(Enum):
+    DEMO = "demo"
+    PROD = "prod"
 
 class KalshiClient:
     """
@@ -23,8 +29,10 @@ class KalshiClient:
         base_url: Optional[str] = None,
         key_id: Optional[str] = None,
         private_key_path: Optional[str] = None,
+        environment: Environment = Environment.DEMO
     ):
         load_dotenv()
+        self.environment = environment
         self.base_url = base_url or os.getenv(
             "KALSHI_DEMO_BASE_URL",
             "https://demo-api.kalshi.co/trade-api/v2",
@@ -36,9 +44,12 @@ class KalshiClient:
             raise ValueError("KALSHI_KEY_ID not set in env and not provided.")
         if not self.private_key_path:
             raise ValueError("KALSHI_PRIVATE_KEY_PATH not set in env and not provided.")
+        
+        if self.environment not in {Environment.DEMO, Environment.PROD}:
+            raise ValueError("Invalid environment specified")
 
         with open(self.private_key_path, "rb") as f:
-            self._private_key = load_pem_private_key(f.read(), password=None)
+            self._private_key = load_pem_private_key(f.read(), password=None,backend=default_backend())
 
     # ---------- low-level helpers ----------
 
@@ -69,10 +80,12 @@ class KalshiClient:
         """
         url = self.base_url + path
         method_upper = method.upper()
+        path_without_query = path.split("?")[0]
 
-        timestamp_ms = str(int(time.time() * 1000))
-        signing_payload = (timestamp_ms + method_upper + path).encode("utf-8")
+        timestamp_ms = str(int(datetime.datetime.now().timestamp() * 1000))
+        signing_payload = f"{timestamp_ms}{method_upper}{path_without_query}".encode("utf-8")
         signature = self._sign(signing_payload)
+        print(method)
 
         headers = {
             "Content-Type": "application/json",
@@ -115,13 +128,13 @@ class KalshiClient:
         """
         GET /portfolio
         """
-        return self._request("GET", "/portfolio")
+        return self._request("GET", "/trade-api/v2/portfolio/balance")
 
     def get_orders(self, **params) -> Dict[str, Any]:
         """
         GET /orders
         """
-        return self._request("GET", "/orders", params=params)
+        return self._request("GET", "/trade-api/v2/orders", params=params)
 
     def create_order(
         self,
@@ -139,11 +152,12 @@ class KalshiClient:
         """
         body = {
             "ticker": ticker,
+            "action":"buy",
             "side": side,
             "count": count,
-            "price": price,
+            "yes_price": price,
+            "type":"limit",
+            "client_order_id": str(uuid.uuid4())
         }
-        if client_order_id:
-            body["client_order_id"] = client_order_id
 
-        return self._request("POST", "/orders", body=body)
+        return self._request("POST", "/trade-api/v2/portfolio/orders", body=body)
