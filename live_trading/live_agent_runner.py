@@ -96,23 +96,26 @@ def build_live_observation(
 
 # ---------- mapping PPO action -> Kalshi order side ----------
 
-def action_to_order_side(action: int) -> str:
+def action_to_side_action(action: int):
     """
-    Map discrete action (0..4) to Kalshi side string.
+    Map PPO action (0..4) to (side, action) for Kalshi.
 
     0: do nothing
-    1: buy  YES   -> "yes_buy"
-    2: sell YES   -> "yes_sell"
-    3: buy  NO    -> "no_buy"
-    4: sell NO    -> "no_sell"
+    1: buy  YES -> side="yes", action="buy"
+    2: sell YES -> side="yes", action="sell"
+    3: buy  NO  -> side="no",  action="buy"
+    4: sell NO  -> side="no",  action="sell"
     """
-    mapping = {
-        1: "yes_buy",
-        2: "yes_sell",
-        3: "no_buy",
-        4: "no_sell",
-    }
-    return mapping.get(action, "")
+    if action == 1:
+        return "yes", "buy"
+    elif action == 2:
+        return "yes", "sell"
+    elif action == 3:
+        return "no", "buy"
+    elif action == 4:
+        return "no", "sell"
+    else:
+        return "", ""  # do nothing
 
 
 # ---------- live loop ----------
@@ -166,7 +169,7 @@ def main():
         try:
             # 1) Fetch BTC hourly markets (adjust filter to match actual ticker symbol)
             markets_resp = client.get_markets(series_ticker="KXBTC",status="open")
-            btc_markets = markets_resp
+            btc_markets = markets_resp.get("markets",[])
 
             # Filter for relevant BTC hourly threshold markets, adjust this filter
             # btc_markets = [
@@ -178,6 +181,8 @@ def main():
                 print("[live] No BTC markets found, sleeping...")
                 time.sleep(poll_interval_sec)
                 continue
+
+            print(btc_markets[:2])
 
             # For now, just pick the next expiring BTC market
             btc_markets.sort(key=lambda m: m.get("expiration_time", ""))
@@ -212,38 +217,31 @@ def main():
             action, _ = model.predict(obs, deterministic=True)
             action = int(action)
 
-            side = action_to_order_side(action)
-            if side == "":
-                print(f"[live] Action {action} -> do nothing.")
+            side, act = action_to_side_action(action)
+            if side == "" or act == "":
+                print(f"[live] Action {action} -> do nothing this cycle.")
                 time.sleep(poll_interval_sec)
                 continue
 
             # 6) Decide order price: we can place at current ask for simplicity
-            side_lower = side.lower()
-            if "yes_buy" in side_lower:
+                # Pick execution price
+            if side == "yes":
                 price = yes_price
-            elif "yes_sell" in side_lower:
-                price = yes_price  # could also use bid
-            elif "no_buy" in side_lower:
-                price = no_price
-            elif "no_sell" in side_lower:
-                price = no_price
             else:
-                price = yes_price  # fallback
+                price = no_price
 
-            # 7) Place order
             print(
-                f"[live] Placing order: ticker={ticker}, side={side}, "
-                f"count={contracts_per_trade}, price={price:.3f}"
+                f"[live] Placing order: event={ticker}, market={ticker}, "
+                f"side={side}, action={act}, count={contracts_per_trade}, price={price:.3f}"
             )
 
             order_resp = client.create_order(
                 ticker=ticker,
                 side=side,
+                action=act,
                 count=contracts_per_trade,
                 price=price,
             )
-
             print("[live] Order response:", order_resp)
 
             # 8) Log to CSV

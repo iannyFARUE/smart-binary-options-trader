@@ -116,7 +116,7 @@ class KalshiClient:
           - ticker: "BTCH"
           - status: "open"
         """
-        return self._request("GET", "/markets", params=params)
+        return self._request("GET", "/trade-api/v2/markets", params=params)
 
     def get_market(self, ticker: str) -> Dict[str, Any]:
         """
@@ -142,6 +142,7 @@ class KalshiClient:
         side: str,
         count: int,
         price: float,
+        action,
         client_order_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -150,14 +151,26 @@ class KalshiClient:
         price: in [0, 1] for Kalshi (probability) or 0-100 depending on API,
                but demo uses 0-1 probabilities in JSON.
         """
+
+        # Normalize price to cents (int)
+        if price <= 1.0:
+            price_cents = int(round(price * 100))
+        else:
+            price_cents = int(round(price))
+        
+
         body = {
             "ticker": ticker,
-            "action":"buy",
             "side": side,
             "count": count,
-            "yes_price": price,
-            "type":"limit",
-            "client_order_id": str(uuid.uuid4())
+            "action":action, # buy | sell,
+            "client_order_id": str(uuid.uuid4()),
+            "type": "limit",
         }
+                # Set yes_price / no_price depending on side
+        # For simplicity we set both to the same price; it's valid.
+        body["yes_price"] = price_cents
+        print(body["yes_price"])
+        # body["no_price"] = 100 - body["yes_price"]  # symmetric; optional but reasonable
 
         return self._request("POST", "/trade-api/v2/portfolio/orders", body=body)
