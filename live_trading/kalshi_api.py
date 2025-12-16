@@ -122,7 +122,7 @@ class KalshiClient:
         """
         GET /markets/{ticker}
         """
-        return self._request("GET", f"/markets/{ticker}")
+        return self._request("GET", f"/trade-api/v2/markets/{ticker}")
 
     def get_portfolio(self) -> Dict[str, Any]:
         """
