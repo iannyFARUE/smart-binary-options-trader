@@ -139,38 +139,52 @@ class KalshiClient:
     def create_order(
         self,
         ticker: str,
-        side: str,
+        side: str,          # "yes" or "no"
+        action: str,        # "buy" or "sell"
         count: int,
-        price: float,
-        action,
+        price: float,       # in [0,1] or [0,100]
         client_order_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        POST /orders
-        side: "yes_buy", "yes_sell", "no_buy", "no_sell"
-        price: in [0, 1] for Kalshi (probability) or 0-100 depending on API,
-               but demo uses 0-1 probabilities in JSON.
+        POST /portfolio/orders
+
+        side   : "yes" or "no"
+        action : "buy" or "sell"
+        count  : number of contracts
+        price  : float in [0,1] (prob) or [0,100] (cents)
+
+        Kalshi expects:
+          - exactly ONE of yes_price or no_price
+          - price in CENTS (int), with 1 <= price <= 99
         """
 
-        # Normalize price to cents (int)
+        # 1) Normalize price to cents
         if price <= 1.0:
             price_cents = int(round(price * 100))
         else:
             price_cents = int(round(price))
-        
 
-        body = {
+        # 2) Clamp to [1, 99] since 0 and 100 are invalid
+        price_cents = max(1, min(99, price_cents))
+
+        body: Dict[str, Any] = {
             "ticker": ticker,
-            "side": side,
+            "side": side,            # "yes" | "no"
+            "action": action,        # "buy" | "sell"
             "count": count,
-            "action":action, # buy | sell,
-            "client_order_id": str(uuid.uuid4()),
             "type": "limit",
+            "client_order_id": client_order_id or str(uuid.uuid4()),
         }
-                # Set yes_price / no_price depending on side
-        # For simplicity we set both to the same price; it's valid.
-        body["yes_price"] = price_cents
-        print(body["yes_price"])
-        # body["no_price"] = 100 - body["yes_price"]  # symmetric; optional but reasonable
 
+        # 3) Set ONLY the correct price field based on side
+        if side == "yes":
+            body["yes_price"] = price_cents
+        elif side == "no":
+            body["no_price"] = price_cents
+        else:
+            raise ValueError(f"Invalid side: {side}, expected 'yes' or 'no'")
+
+        print("[DEBUG] create_order body:", body)
+
+        # base_url already has /trade-api/v2, so path is just /portfolio/orders
         return self._request("POST", "/trade-api/v2/portfolio/orders", body=body)
