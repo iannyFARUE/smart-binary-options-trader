@@ -184,7 +184,5 @@ class KalshiClient:
         else:
             raise ValueError(f"Invalid side: {side}, expected 'yes' or 'no'")
 
-        print("[DEBUG] create_order body:", body)
-
         # base_url already has /trade-api/v2, so path is just /portfolio/orders
         return self._request("POST", "/trade-api/v2/portfolio/orders", body=body)

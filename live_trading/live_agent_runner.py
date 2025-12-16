@@ -189,11 +189,39 @@ def main():
             market = btc_markets[0]
             ticker = market["ticker"]
 
-            # 2) Determine BTC spot price
-            #    For simplicity, we approximate with market's implied threshold or midpoint.
-            #    In a more advanced version, you'd query a separate BTC price feed.
-            yes_price = float(market.get("yes_ask") or market.get("yes_price") or 0.5)
-            no_price = float(market.get("no_ask") or market.get("no_price") or (1.0 - yes_price))
+            # --- Normalize yes/no prices from Kalshi (0..100 cents) to 0..1 probabilities ---
+            def norm_price_raw(raw, default):
+                """
+                Convert raw Kalshi price (cents or 0-1) to float in [0,1].
+                If raw is None, use default.
+                """
+                if raw is None:
+                    return default
+
+                if isinstance(raw, str):
+                    raw = float(raw)
+
+                raw = float(raw)
+
+                # If > 1.0, treat as cents (0..100)
+                if raw > 1.0:
+                    return raw / 100.0
+
+                return raw
+
+
+            yes_raw = market.get("yes_ask", None) or market.get("yes_bid", None)
+            no_raw  = market.get("no_ask", None) or market.get("no_bid", None)
+
+            # First try to normalize from the book; if both are missing, fall back to 0.5 / 0.5
+            yes_price = norm_price_raw(yes_raw, default=0.5)
+            no_price  = norm_price_raw(no_raw, default=(1.0 - yes_price))
+
+            # Optional: clamp a bit to avoid exactly 0 or 1
+            yes_price = max(0.01, min(0.99, yes_price))
+            no_price  = max(0.01, min(0.99, no_price))
+
+            print("[DEBUG] normalized yes_price=", yes_price, "no_price=", no_price)
             # crude proxy: treat 0.5 as at-the-money, but we don't know exact threshold here.
             # For now, just treat btc_price as a dummy variable consistent with training scale:
             btc_price = btc_mean + (yes_price - 0.5) * 2 * btc_std  # hacky but consistent scale
@@ -243,6 +271,7 @@ def main():
                 price=price,
             )
             print("[live] Order response:", order_resp)
+            print(order_resp.keys())
 
             # 8) Log to CSV
             with open(log_path, "a", newline="") as f:
@@ -254,13 +283,13 @@ def main():
                         btc_price,
                         yes_price,
                         no_price,
-                        action,
+                        order_resp["order"]["action"],
                         side,
                         contracts_per_trade,
                         price,
                         portfolio_value,
-                        order_resp.user_id,
-                        order_resp.order_id
+                        order_resp["order"]["user_id"],
+                        order_resp["order"]["order_id"]
                     ]
                 )
 
