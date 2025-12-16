@@ -168,7 +168,7 @@ def main():
     while True:
         try:
             # 1) Fetch BTC hourly markets (adjust filter to match actual ticker symbol)
-            markets_resp = client.get_markets(series_ticker="KXBTC",status="open")
+            markets_resp = client.get_markets(series_ticker="KXBTC",status="open",filter_liquid=True)
             btc_markets = markets_resp.get("markets",[])
 
             # Filter for relevant BTC hourly threshold markets, adjust this filter

@@ -64,7 +64,7 @@ def train():
     model.set_logger(new_logger)
 
     # Train for a small number of steps just to see if it runs
-    model.learn(total_timesteps=5_000_000)
+    model.learn(total_timesteps=10_000_000)
 
     model_path = "./agent/models/ppo_kalshi_realdata.zip"
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
