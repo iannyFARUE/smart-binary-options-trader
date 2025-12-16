@@ -303,10 +303,16 @@ def main():
     # Auto-refresh using Streamlit's built-in rerun trick
     st.sidebar.markdown("---")
     st.sidebar.caption("This page auto-refreshes based on the selected interval.")
-    st.experimental_rerun() if st.session_state.get(
-        "last_refresh", 0
-    ) < (datetime.now().timestamp() - refresh_seconds) else None
-    st.session_state["last_refresh"] = datetime.now().timestamp()
+    # ---------- Auto-refresh ----------
+    import time
+
+    last_run = st.session_state.get("last_run", 0)
+    now = time.time()
+
+    if now - last_run > refresh_seconds:
+        st.session_state["last_run"] = now
+        st.rerun()
+
 
 
 if __name__ == "__main__":
