@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 
 from live_trading.kalshi_api import Environment, KalshiClient
+from agent.train_agent import train
 
 
 def resolve_environment() -> Environment:
@@ -24,4 +25,4 @@ def main():
     print(f"Balance is {markets_resp}")
 
 if __name__ == "__main__":
-    main()
+    train()
