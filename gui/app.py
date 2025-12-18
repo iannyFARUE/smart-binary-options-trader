@@ -168,137 +168,203 @@ def main():
     config = KalshiEnvConfig()
     model = load_model()
 
+    live_df = load_live_trades()
+    print(live_df)
+
+    tab_overview, tab_markets, tab_trades = st.tabs(
+        ["📊 Overview", "📈 Markets & Agent", "📜 Trades"]
+    )
+
+
+
     # Portfolio section
-    try:
-        portfolio = client.get_portfolio()
-        cash = float(portfolio.get("cash", INITIAL_CASH))
-    except Exception as e:
-        st.error(f"Error fetching portfolio: {e}")
-        portfolio = {}
-        cash = INITIAL_CASH
+    with tab_overview:
+        st.subheader("Portfolio Overview")
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Portfolio cash (demo)", f"${cash:,.2f}")
-    with col2:
-        st.metric("Initial cash", f"${INITIAL_CASH:,.2f}")
-    with col3:
-        # if you later track equity in live logs, show last value here
-        live_df = load_live_trades()
-        if not live_df.empty and "portfolio_cash" in live_df.columns:
-            last_equity = live_df["portfolio_cash"].iloc[-1]
-            delta = last_equity - INITIAL_CASH
-            st.metric("Live equity (approx.)", f"${last_equity:,.2f}", f"{delta:,.2f} vs start")
+        # Portfolio & equity
+        try:
+            portfolio = client.get_portfolio()
+            cash = float(portfolio.get("cash", INITIAL_CASH))
+        except Exception as e:
+            st.error(f"Error fetching portfolio: {e}")
+            portfolio = {}
+            cash = INITIAL_CASH
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Portfolio cash (demo)", f"${cash:,.2f}")
+        with col2:
+            st.metric("Initial cash", f"${INITIAL_CASH:,.2f}")
+        with col3:
+            if not live_df.empty and "portfolio_cash" in live_df.columns:
+                last_equity = live_df["portfolio_cash"].iloc[-1]
+                delta = last_equity - INITIAL_CASH
+                st.metric(
+                    "Live equity (approx.)",
+                    f"${last_equity:,.2f}",
+                    f"{delta:,.2f} vs start",
+                )
+            else:
+                st.metric("Live equity (approx.)", "N/A")
+
+        st.markdown("### Equity Curve (Live Demo)")
+
+        if not live_df.empty and "portfolio_value" in live_df.columns:
+            df_plot = (
+                live_df[["timestamp", "portfolio_value"]]
+                .sort_values("timestamp")
+                .set_index("timestamp")
+            )
+            st.line_chart(df_plot, height=250)
         else:
-            st.metric("Live equity (approx.)", "N/A")
+            st.info("No live equity data yet. Let the live agent run a bit longer.")
 
-    st.markdown("---")
 
     # Fetch BTC events with nested markets
-    st.subheader("🧠 Current BTC Hourly Markets")
+    with tab_markets:
+        st.subheader("BTC Hourly Markets")
 
-    try:
-        events_resp = client.get_markets(
-            series_ticker=btc_series_ticker,
-            status="open",
-            with_nested_markets=True,
-            limit=50,
-        )
-        events = events_resp.get("markets", [])
-    except Exception as e:
-        st.error(f"Error fetching BTC events: {e}")
-        events = []
+        btc_series_ticker = os.getenv("KALSHI_BTC_SERIES_TICKER", "KXBTC")
+        st.caption(f"Using BTC series ticker: `{btc_series_ticker}`")
 
-    markets_rows = []
-    for ev in events:
-        ev_ticker = ev.get("event_ticker")
-        ev_title = ev.get("title")
-        ticker = ev.get("ticker")
-        expiry = ev.get("expiration_time")
-        yes_raw = ev.get("yes_ask", None) or ev.get("yes_bid", None)
-        no_raw = ev.get("no_ask", None) or ev.get("no_bid", None)
-        yes_p = norm_price_raw(yes_raw, default=0.5)
-        no_p = norm_price_raw(no_raw, default=(1.0 - yes_p))
+        # Fetch BTC events with nested markets
+        try:
+            markets_resp = client.get_markets(
+                series_ticker=btc_series_ticker,
+                status="open",
+                with_nested_markets=True,
+                limit=50,
+                filter_liquid=True
+            )
+            markets = markets_resp.get("markets", [])
+        except Exception as e:
+            st.error(f"Error fetching BTC markets: {e}")
+            markets = []
 
-        markets_rows.append(
-            {
-                "event_ticker": ev_ticker,
-                "event_title": ev_title,
-                "market_ticker": ticker,
-                "expiration_time": expiry,
-                "yes_price_est": round(yes_p, 3),
-                "no_price_est": round(no_p, 3),
-            }
-        )
+        markets_rows = []
+        for m in markets:
+            ev_ticker = m.get("event_ticker")
+            ev_title = m.get("title")
+            ticker = m.get("ticker")
+            expiry = m.get("expiration_time")
+            yes_raw = m.get("yes_ask", None) or m.get("yes_bid", None)
+            no_raw = m.get("no_ask", None) or m.get("no_bid", None)
+            yes_p = norm_price_raw(yes_raw, default=0.5)
+            no_p = norm_price_raw(no_raw, default=(1.0 - yes_p))
 
-    if markets_rows:
-        markets_df = pd.DataFrame(markets_rows)
-        markets_df = markets_df.sort_values("expiration_time")
-        st.dataframe(
-            markets_df,
-            use_container_width=True,
-            hide_index=True,
-        )
-    else:
-        st.info("No open BTC markets found at the moment.")
-
-    st.markdown("---")
-
-    # Agent recommendation for next market
-    st.subheader("🤖 RL Agent Recommendation")
-
-    if markets_rows:
-        # pick the next expiring market
-        next_market_row = markets_df.iloc[0]
-        next_market_ticker = next_market_row["market_ticker"]
-
-        # find the corresponding market JSON
-        selected_market = None
-        for ev in events:
-            if ev.get("ticker") == next_market_ticker:
-                selected_market = ev
-                break
-            if selected_market:
-                break
-
-        if selected_market is not None:
-            obs, yes_p, no_p, btc_proxy = build_obs_for_market(
-                selected_market, portfolio_cash=cash, config=config
+            markets_rows.append(
+                {
+                    "event_ticker": ev_ticker,
+                    "event_title": ev_title,
+                    "market_ticker": ticker,
+                    "expiration_time": expiry,
+                    "YES price (est)": round(yes_p, 3),
+                    "NO price (est)": round(no_p, 3),
+                }
             )
 
-            action, _ = model.predict(obs, deterministic=True)
-            action = int(action)
-            side, act = action_to_side_action(action)
-
-            st.write(f"**Next expiring market:** `{next_market_ticker}`")
-            st.write(f"- Approx. BTC proxy: `{btc_proxy:.2f}`")
-            st.write(f"- YES price ≈ `{yes_p:.2f}`, NO price ≈ `{no_p:.2f}`")
-
-            if side == "" or act == "":
-                st.warning("Agent recommendation: **do nothing** for this market.")
-            else:
-                nice_side = "YES" if side == "yes" else "NO"
-                nice_action = "buy" if act == "buy" else "sell"
-                st.success(
-                    f"Agent recommendation: **{nice_action.upper()} {nice_side}** "
-                    f"on `{next_market_ticker}` (1 contract, demo)."
-                )
+        if markets_rows:
+            markets_df = pd.DataFrame(markets_rows)
+            markets_df = markets_df.sort_values("expiration_time")
+            st.dataframe(
+                markets_df,
+                use_container_width=True,
+                hide_index=True,
+            )
         else:
-            st.info("Could not match next market in event list.")
-    else:
-        st.info("No markets to evaluate recommendation on.")
+            st.info("No open BTC markets found at the moment.")
 
-    st.markdown("---")
+        st.markdown("---")
+        st.subheader("🤖 RL Agent Recommendation")
+
+        if markets_rows:
+            # pick the next expiring market
+            next_market_row = markets_df.iloc[0]
+            next_market_ticker = next_market_row["market_ticker"]
+
+            # find the corresponding market JSON
+            selected_market = None
+            for ev in events:
+                for m in ev.get("markets", []):
+                    if m.get("ticker") == next_market_ticker:
+                        selected_market = m
+                        break
+                if selected_market:
+                    break
+
+            if selected_market is not None:
+                obs, yes_p, no_p, btc_proxy = build_obs_for_market(
+                    selected_market, portfolio_cash=cash, config=config
+                )
+
+                action, _ = model.predict(obs, deterministic=True)
+                action = int(action)
+                side, act = action_to_side_action(action)
+
+                st.write(f"**Next expiring market:** `{next_market_ticker}`")
+                st.write(f"- Approx. BTC proxy: `{btc_proxy:.2f}`")
+                st.write(f"- YES price ≈ `{yes_p:.2f}`, NO price ≈ `{no_p:.2f}`")
+
+                if side == "" or act == "":
+                    st.warning("Agent recommendation: **do nothing** for this market.")
+                else:
+                    nice_side = "YES" if side == "yes" else "NO"
+                    nice_action = "BUY" if act == "buy" else "SELL"
+
+                    bg_color = "#16a34a" if act == "buy" else "#dc2626"  # green / red
+
+                    st.markdown(
+                        f"""
+                        <div style="
+                            padding: 1rem;
+                            border-radius: 0.75rem;
+                            background-color: {bg_color};
+                            color: white;
+                            font-weight: 600;
+                            font-size: 1.05rem;
+                        ">
+                            Agent recommendation: {nice_action} {nice_side}
+                            (1 contract, demo)
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.info("Could not match next market in event list.")
+        else:
+            st.info("No markets to evaluate recommendation on.")
+
 
     # Recent trades table
-    st.subheader("📜 Recent Live Trades (from log)")
+    with tab_trades:
+        st.subheader("Recent Live Trades")
 
-    if live_df.empty:
-        st.info("No live trades logged yet. Let the live agent run for a while.")
-    else:
-        # Show last N trades
-        live_df_display = live_df.sort_values("timestamp", ascending=False).head(20)
-        st.dataframe(live_df_display, use_container_width=True)
+        if live_df.empty:
+            st.info("No live trades logged yet. Let the live agent run for a while.")
+        else:
+            live_df_sorted = live_df.sort_values("timestamp", ascending=False)
+
+            # basic stats
+            st.markdown("### Quick Stats")
+            last_equity = live_df_sorted["portfolio_value"].iloc[0]
+            delta = last_equity - INITIAL_CASH
+            n_trades = len(live_df_sorted)
+
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                st.metric("Last equity snapshot", f"${last_equity:,.2f}")
+            with col_b:
+                st.metric("PnL vs start", f"${delta:,.2f}")
+            with col_c:
+                st.metric("Logged trade events", f"{n_trades}")
+
+            st.markdown("### Trade Log (latest 50)")
+            st.dataframe(
+                live_df_sorted.head(50),
+                use_container_width=True,
+                hide_index=True,
+            )
+
 
     # Auto-refresh using Streamlit's built-in rerun trick
     st.sidebar.markdown("---")
