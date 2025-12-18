@@ -66,11 +66,11 @@ def build_live_observation(
     for pos in positions:
         if pos.get("ticker") == ticker:
             # Example fields: side ("yes" / "no"), count
-            side = pos.get("side")
+            side_pos = pos.get("side")
             count = float(pos.get("count", 0))
-            if side == "yes":
+            if side_pos == "yes":
                 pos_yes += count
-            elif side == "no":
+            elif side_pos == "no":
                 pos_no += count
 
     # 5) Cash normalized
@@ -246,6 +246,17 @@ def main():
             action = int(action)
 
             side, act = action_to_side_action(action)
+
+            # If trying to sell with no position, override to "do nothing"
+            if act == "sell":
+                if side == "yes" and obs[-3] <= 0:
+                    print("[live] Agent wants to SELL YES but position_yes=0 -> skipping (no-op).")
+                    time.sleep(poll_interval_sec)
+                    continue
+                if side == "no" and obs[-2] <= 0:
+                    print("[live] Agent wants to SELL NO but position_no=0 -> skipping (no-op).")
+                    time.sleep(poll_interval_sec)
+                    continue
             if side == "" or act == "":
                 print(f"[live] Action {action} -> do nothing this cycle.")
                 time.sleep(poll_interval_sec)
