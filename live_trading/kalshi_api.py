@@ -108,6 +108,115 @@ class KalshiClient:
 
         return resp.json()
     
+    @staticmethod
+    def filter_liquid_markets(
+        markets: List[Dict[str, Any]], 
+        min_liquidity: float = 0,
+        min_spread_pct: float = 50.0
+    ) -> List[Dict[str, Any]]:
+        """
+        Filter markets to only those with real liquidity.
+        
+        Args:
+            markets: List of market dicts
+            min_liquidity: Minimum liquidity in dollars (default 0)
+            min_spread_pct: Maximum spread percentage (default 50%)
+        
+        Returns:
+            Filtered list of markets
+        """
+        liquid_markets = []
+        
+        for market in markets:
+            if not KalshiClient.has_liquidity(market, min_spread_pct):
+                continue
+            
+            # Optional: filter by minimum liquidity amount
+            liquidity = float(market.get("liquidity_dollars", "0"))
+            if liquidity < min_liquidity:
+                continue
+            
+            liquid_markets.append(market)
+        
+        return liquid_markets
+
+    # ---------- high-level API helpers ----------
+    def get_market(self, ticker: str) -> Dict[str, Any]:
+        """
+        GET /markets/{ticker}
+        """
+        return self._request("GET", f"/trade-api/v2/markets/{ticker}")
+    
+    @staticmethod
+    def has_liquidity(market: Dict[str, Any], min_spread_pct: float = 50.0) -> bool:
+        """
+        Check if a market has tradeable liquidity.
+        
+        Args:
+            market: Market data dict
+            min_spread_pct: Maximum spread percentage to consider liquid (default 50%)
+        
+        Returns:
+            True if market has real liquidity
+        """
+        yes_bid = market.get("yes_bid", 0)
+        yes_ask = market.get("yes_ask", 0)
+        no_bid = market.get("no_bid", 0)
+        no_ask = market.get("no_ask", 0)
+        
+        # Filter out empty order books
+        if yes_bid == 0 and yes_ask == 0 and no_bid == 100 and no_ask == 100:
+            return False
+        
+        # Check if there's a valid spread on either side
+        has_yes_liquidity = 0 < yes_bid < yes_ask < 100
+        has_no_liquidity = 0 < no_bid < no_ask < 100
+        
+        # Optional: check spread width
+        if has_yes_liquidity:
+            yes_spread = (yes_ask - yes_bid) / yes_ask * 100
+            if yes_spread > min_spread_pct:
+                has_yes_liquidity = False
+        
+        if has_no_liquidity:
+            no_spread = (no_ask - no_bid) / no_ask * 100
+            if no_spread > min_spread_pct:
+                has_no_liquidity = False
+        
+        return has_yes_liquidity or has_no_liquidity
+    
+    @staticmethod
+    def get_best_prices(market: Dict[str, Any]) -> Dict[str, Optional[int]]:
+        """
+        Extract best bid/ask prices from a market.
+        
+        Returns:
+            Dict with 'yes_bid', 'yes_ask', 'no_bid', 'no_ask' or None if not available
+        """
+        yes_bid = market.get("yes_bid", 0)
+        yes_ask = market.get("yes_ask", 0)
+        no_bid = market.get("no_bid", 0)
+        no_ask = market.get("no_ask", 0)
+        
+        return {
+            "yes_bid": yes_bid if 0 < yes_bid < 100 else None,
+            "yes_ask": yes_ask if 0 < yes_ask < 100 else None,
+            "no_bid": no_bid if 0 < no_bid < 100 else None,
+            "no_ask": no_ask if 0 < no_ask < 100 else None,
+        }
+
+    def get_portfolio(self) -> Dict[str, Any]:
+        """
+        GET /portfolio
+        """
+        return self._request("GET", "/trade-api/v2/portfolio/balance")
+
+    def get_orders(self, **params) -> Dict[str, Any]:
+        """
+        GET /orders
+        """
+        return self._request("GET", "/trade-api/v2/orders", params=params)
+
     def create_order(
         self,
         ticker: str,
@@ -158,3 +267,18 @@ class KalshiClient:
 
         # base_url already has /trade-api/v2, so path is just /portfolio/orders
         return self._request("POST", "/trade-api/v2/portfolio/orders", body=body)
+    
+    def get_markets(self, filter_liquid: bool = False, **params) -> Dict[str, Any]:
+        """
+        GET /markets
+        Use filters like:
+        - ticker: "BTCH"
+        - status: "open"
+        - filter_liquid: if True, only return markets with real liquidity
+        """
+        result = self._request("GET", "/trade-api/v2/markets", params=params)
+        
+        if filter_liquid and "markets" in result:
+            result["markets"] = self.filter_liquid_markets(result["markets"])
+        
+        return result

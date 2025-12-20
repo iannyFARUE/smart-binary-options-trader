@@ -8,7 +8,7 @@ from scripts.market_orders import create_orders
 
 
 def main():
-    create_orders()
+    train()
 
 
 if __name__ == "__main__":

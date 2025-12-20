@@ -1,301 +1,312 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
-from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any
 
+
+# -----------------------------
+# Config
+# -----------------------------
 
 @dataclass
 class KalshiEnvConfig:
     initial_cash: float = 10_000.0
-    trading_hours: Tuple[int, ...] = tuple(range(9, 25))  # 9..24 inclusive
-    max_yes_position: int = 100
-    max_no_position: int = 100
-    fee_per_contract: float = 0.002  # e.g. 0.2% per contract notional
-    spread_bps: float = 0.01         # 1% spread
-    obs_normalize_cash: bool = True
 
+    # Trading constraints
+    max_position_per_market: int = 5          # max contracts you can hold in a single hourly market
+    trade_size: int = 1                       # contracts per action (keep it simple for PPO)
+
+    # Frictions (realism)
+    fee_per_contract: float = 0.002           # $0.002 per contract
+    slippage_cents: int = 1                   # 1 cent worse than observed price
+
+    # Reward shaping
+    reward_scale: float = 100.0               # amplify reward for PPO stability
+    turnover_penalty: float = 0.001           # penalty per contract traded
+    inventory_penalty: float = 0.0005         # penalty * (inventory^2) per step (discourage big exposure)
+
+    # Feature engineering
+    lookback: int = 5                         # rolling window for volatility
+
+
+# -----------------------------
+# Feature utilities
+# -----------------------------
+
+def _ensure_features(events_df: pd.DataFrame, lookback: int) -> pd.DataFrame:
+    """
+    Ensures btc_ret and btc_vol exist.
+    Assumes events_df has: day, hour, btc_price
+    """
+    df = events_df.copy()
+
+    # basic sanity
+    for col in ["day", "hour", "btc_price", "yes_price", "no_price", "outcome"]:
+        if col not in df.columns:
+            raise ValueError(f"events_df missing required column: {col}")
+
+    # sort for consistent rolling calcs
+    df = df.sort_values(["day", "hour"]).reset_index(drop=True)
+
+    if "btc_ret" not in df.columns:
+        df["btc_ret"] = df.groupby("day")["btc_price"].pct_change().fillna(0.0)
+
+    if "btc_vol" not in df.columns:
+        # rolling std of returns per day
+        df["btc_vol"] = (
+            df.groupby("day")["btc_ret"]
+              .rolling(lookback, min_periods=1)
+              .std()
+              .reset_index(level=0, drop=True)
+              .fillna(0.0)
+        )
+
+    # clamp market prices to [0,1]
+    df["yes_price"] = df["yes_price"].clip(0.0, 1.0)
+    df["no_price"] = df["no_price"].clip(0.0, 1.0)
+
+    # outcome must be 0/1
+    df["outcome"] = df["outcome"].astype(int).clip(0, 1)
+
+    return df
+
+
+def _hour_sin_cos(hour: int) -> Tuple[float, float]:
+    hr = int(hour) % 24
+    rad = 2 * np.pi * hr / 24.0
+    return float(np.sin(rad)), float(np.cos(rad))
+
+
+# -----------------------------
+# Environment
+# -----------------------------
 
 class KalshiBTCHourlyEnv(gym.Env):
     """
-    Gymnasium-style environment simulating Kalshi-like hourly BTC threshold markets.
+    Realistic-ish backtest env for Kalshi-style hourly BTC threshold contracts.
 
-    One episode = one trading day.
-    One step     = one hourly contract (9:00, 10:00, ..., 24:00).
+    IMPORTANT DESIGN:
+    - Each step is ONE hourly market (one contract).
+    - Any positions taken in that market are settled immediately at the end of the step
+      using the market's outcome (0/1). This matches the reality that a 10AM market
+      resolves at 10AM and doesn't carry to 11AM.
 
-    DataFrame expected columns:
-        - day         : episode identifier (int or date)
-        - hour        : integer trading hour (9..24)
-        - btc_price   : float
-        - yes_price   : float in [0, 1]
-        - no_price    : float in [0, 1]
-        - outcome     : 1 if BTC > threshold at that hour, else 0
+    Actions (Discrete):
+      0 = HOLD
+      1 = BUY YES (trade_size contracts)
+      2 = BUY NO  (trade_size contracts)
 
-    Prices are in probability space (0..1). Reward is change in portfolio value.
+    State includes:
+      btc_norm, btc_ret, btc_vol, yes_price, no_price, hour_sin, hour_cos,
+      inventory (contracts in current market), cash_norm
+
+    Reward:
+      reward = (delta_equity - penalties) * reward_scale
+      - turnover penalty discourages churn
+      - inventory penalty discourages maxing size constantly
     """
 
-    metadata = {"render_modes": ["human"]}
+    metadata = {"render_modes": []}
 
-    def __init__(
-        self,
-        data: pd.DataFrame,
-        config: Optional[KalshiEnvConfig] = None,
-        render_mode: Optional[str] = None,
-    ):
+    def __init__(self, events_df: pd.DataFrame, config: Optional[KalshiEnvConfig] = None):
         super().__init__()
-
-        assert {"day", "hour", "btc_price", "yes_price", "no_price", "outcome"}.issubset(
-            data.columns
-        ), "DataFrame missing required columns."
-
-        self.raw_data = data.copy().reset_index(drop=True)
         self.config = config or KalshiEnvConfig()
-        self.render_mode = render_mode
 
-        # Precompute per-day groups for fast reset
-        self.days = sorted(self.raw_data["day"].unique())
-        self.day_to_idx = {d: i for i, d in enumerate(self.days)}
+        self.raw_data = _ensure_features(events_df, lookback=self.config.lookback)
 
-        # Compute stats for normalization
-        self.btc_mean = self.raw_data["btc_price"].mean()
-        self.btc_std = self.raw_data["btc_price"].std() or 1.0
+        # unique days
+        self.days = sorted(self.raw_data["day"].unique().tolist())
 
-        # Define action & observation spaces
-        self.action_space = spaces.Discrete(5)  # 0..4, as defined above
+        # Precompute BTC normalization stats (global)
+        self.btc_mean = float(self.raw_data["btc_price"].mean())
+        self.btc_std = float(self.raw_data["btc_price"].std()) if float(self.raw_data["btc_price"].std()) > 0 else 1.0
 
-        # Observation: [btc_norm, yes, no, hour_sin, hour_cos, pos_yes, pos_no, cash_norm]
-        obs_dim = 8
-        self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(obs_dim,),
-            dtype=np.float32,
-        )
+        # Action space: HOLD, BUY YES, BUY NO
+        self.action_space = spaces.Discrete(3)
 
-        # Internal state
-        self.current_day: Optional[int] = None
-        self.day_data: Optional[pd.DataFrame] = None
-        self.t: int = 0  # index within the trading_hours sequence
+        # Observation space (10 dims)
+        # [btc_norm, btc_ret, btc_vol, yes_p, no_p, hour_sin, hour_cos, inv, cash_norm]
+        low = np.array([-10, -1, 0, 0, 0, -1, -1, 0, 0], dtype=np.float32)
+        high = np.array([10, 1, 10, 1, 1, 1, 1, self.config.max_position_per_market, 2], dtype=np.float32)
+        self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
+        # Episode state
+        self.day_idx: int = 0
+        self.t: int = 0
+        self.day_events: pd.DataFrame = pd.DataFrame()
+        self.current_row: Optional[pd.Series] = None
+
+        # Portfolio state
         self.cash: float = self.config.initial_cash
-        self.position_yes: int = 0
-        self.position_no: int = 0
-        self.portfolio_value: float = self.config.initial_cash
+        self.inventory: int = 0  # contracts held in current market (resets each step)
 
-    # ------------- core gym methods -------------
+        # RNG
+        self.np_random = np.random.default_rng()
 
-    def reset(
-        self,
-        seed: Optional[int] = None,
-        options: Optional[Dict[str, Any]] = None,
-    ):
-        super().reset(seed=seed)
+    # -------------
+    # Gym API
+    # -------------
 
-        # Choose random day if not specified
-        if options and "day" in options:
-            day = options["day"]
-        else:
-            day = self.np_random.choice(self.days)
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+        if seed is not None:
+            self.np_random = np.random.default_rng(seed)
 
-        self.current_day = day
-        self.day_data = (
+        # choose a random day to reduce overfitting
+        self.day_idx = int(self.np_random.integers(0, len(self.days)))
+        day = self.days[self.day_idx]
+
+        self.day_events = (
             self.raw_data[self.raw_data["day"] == day]
             .sort_values("hour")
             .reset_index(drop=True)
         )
 
-        # Filter only trading hours we care about
-        self.day_data = self.day_data[
-            self.day_data["hour"].isin(self.config.trading_hours)
-        ].reset_index(drop=True)
-
-        # Reset time index and portfolio
         self.t = 0
         self.cash = self.config.initial_cash
-        self.position_yes = 0
-        self.position_no = 0
-        self.portfolio_value = self._compute_portfolio_value()
+        self.inventory = 0
 
-        obs = self._get_observation()
-        info = {"day": int(self.current_day), "t": int(self.t)}
+        self.current_row = self.day_events.iloc[self.t]
+        obs = self._get_obs()
+
+        info = {
+            "day": day,
+            "t": self.t,
+            "cash": self.cash,
+            "portfolio_value": self.cash,
+        }
         return obs, info
 
     def step(self, action: int):
-        assert self.day_data is not None, "Environment not reset."
+        assert self.current_row is not None, "Call reset() before step()."
 
-        # Get current row (market info for this hour)
-        row = self.day_data.iloc[self.t]
-        yes_price = float(row["yes_price"])
-        no_price = float(row["no_price"])
+        row = self.current_row
 
-        # Apply action (update positions & cash)
-        self._apply_action(action, yes_price, no_price)
+        yes_p = float(row["yes_price"])  # 0..1 ($)
+        no_p = float(row["no_price"])    # 0..1 ($)
+        outcome = int(row["outcome"])    # 0/1
 
-        # Move to next time step
-        prev_portfolio_value = self.portfolio_value
+        prev_equity = self.cash  # no carry positions; equity starts as cash each step
 
-        # At resolution time (end of hour), contracts settle:
-        # For simplicity: we assume this hour resolves immediately after trading.
-        outcome = int(row["outcome"])
-        self._settle_contracts(outcome, yes_price, no_price)
+        # --- execute trade ---
+        traded_contracts = 0
+        if action == 1:  # BUY YES
+            can_buy = self.inventory + self.config.trade_size <= self.config.max_position_per_market
+            if can_buy:
+                # pay worse price due to slippage
+                exec_price = min(1.0, yes_p + self.config.slippage_cents / 100.0)
+                cost = self.config.trade_size * exec_price + self.config.trade_size * self.config.fee_per_contract
+                if self.cash >= cost:
+                    self.cash -= cost
+                    self.inventory += self.config.trade_size
+                    traded_contracts = self.config.trade_size
 
-        self.portfolio_value = self._compute_portfolio_value()
+        elif action == 2:  # BUY NO
+            can_buy = self.inventory + self.config.trade_size <= self.config.max_position_per_market
+            if can_buy:
+                exec_price = min(1.0, no_p + self.config.slippage_cents / 100.0)
+                cost = self.config.trade_size * exec_price + self.config.trade_size * self.config.fee_per_contract
+                if self.cash >= cost:
+                    self.cash -= cost
+                    self.inventory += self.config.trade_size
+                    traded_contracts = self.config.trade_size
 
-        # Reward: change in portfolio value relative to initial capital
-        reward = (self.portfolio_value - prev_portfolio_value) / self.config.initial_cash
+        # HOLD (0): nothing
 
+        # --- settle this hourly market immediately ---
+        # If agent bought YES: payoff = 1 if outcome==1 else 0
+        # If agent bought NO : payoff = 1 if outcome==0 else 0
+        payoff = 0.0
+        if action == 1:  # YES contracts
+            payoff = float(self.inventory) * float(outcome)
+        elif action == 2:  # NO contracts
+            payoff = float(self.inventory) * float(1 - outcome)
+
+        self.cash += payoff
+
+        # inventory resets each market
+        inv_after = self.inventory
+        self.inventory = 0
+
+        # --- reward ---
+        equity = self.cash
+        pnl = equity - prev_equity  # realized PnL from this market
+
+        penalty_turnover = self.config.turnover_penalty * abs(traded_contracts)
+        penalty_inventory = self.config.inventory_penalty * float(inv_after ** 2)
+
+        reward = (pnl - penalty_turnover - penalty_inventory) * self.config.reward_scale
+
+        # --- advance time ---
         self.t += 1
-        terminated = self.t >= len(self.day_data)  # end of day
-        truncated = False  # no truncation logic yet
+        done = self.t >= len(self.day_events)
 
-        if not terminated:
-            obs = self._get_observation()
+        if not done:
+            self.current_row = self.day_events.iloc[self.t]
+            obs = self._get_obs()
         else:
-            obs = self._get_observation()  # could also return final obs
+            obs = np.zeros(self.observation_space.shape, dtype=np.float32)
 
         info = {
-            "day": self.current_day,
+            "day": self.days[self.day_idx],
             "t": self.t,
-            "portfolio_value": self.portfolio_value,
             "cash": self.cash,
-            "position_yes": self.position_yes,
-            "position_no": self.position_no,
+            "portfolio_value": self.cash,
+            "pnl": pnl,
+            "traded_contracts": traded_contracts,
+            "inv_before_settle": inv_after,
             "outcome": outcome,
+            "yes_price": yes_p,
+            "no_price": no_p,
         }
 
-        if self.render_mode == "human":
-            self.render()
+        return obs, float(reward), bool(done), False, info
 
-        return obs, reward, terminated, truncated, info
+    # -------------
+    # Internals
+    # -------------
 
-    def render(self):
-        print(
-            f"Day {self.current_day}, step {self.t}, "
-            f"cash={self.cash:.2f}, YES={self.position_yes}, "
-            f"NO={self.position_no}, portfolio={self.portfolio_value:.2f}"
-        )
-
-    # ------------- internal helpers -------------
-
-    def _get_observation(self) -> np.ndarray:
-        """Builds current observation vector."""
-        assert self.day_data is not None, "Env not initialized."
-        t_idx = min(self.t, len(self.day_data) - 1)
-        row = self.day_data.iloc[t_idx]
+    def _get_obs(self) -> np.ndarray:
+        row = self.current_row
+        assert row is not None
 
         btc_price = float(row["btc_price"])
-        yes_price = float(row["yes_price"])
-        no_price = float(row["no_price"])
+        btc_ret = float(row["btc_ret"])
+        btc_vol = float(row["btc_vol"])
+
+        yes_p = float(row["yes_price"])
+        no_p = float(row["no_price"])
+
         hour = int(row["hour"])
+        hour_sin, hour_cos = _hour_sin_cos(hour)
 
         btc_norm = (btc_price - self.btc_mean) / self.btc_std
+        cash_norm = self.cash / self.config.initial_cash
 
-        # Time-of-day encoding
-        hour_rad = 2 * np.pi * hour / 24.0
-        hour_sin = np.sin(hour_rad)
-        hour_cos = np.cos(hour_rad)
-
-        # Positions & cash
-        pos_yes = float(self.position_yes)
-        pos_no = float(self.position_no)
-        cash_norm = (
-            self.cash / self.config.initial_cash
-            if self.config.obs_normalize_cash
-            else self.cash
-        )
+        # inventory is always 0 at observation time in this env design
+        # (since each market is one step). That’s OK; we keep the field for clarity.
+        inv = 0.0
 
         obs = np.array(
             [
                 btc_norm,
-                yes_price,
-                no_price,
+                btc_ret,
+                btc_vol,
+                yes_p,
+                no_p,
                 hour_sin,
                 hour_cos,
-                pos_yes,
-                pos_no,
+                inv,
                 cash_norm,
             ],
             dtype=np.float32,
         )
         return obs
 
-    def _compute_portfolio_value(self) -> float:
-        """Current cash + mark-to-market of open positions."""
-        if self.day_data is None:
-            return self.cash
-
-        t_idx = min(self.t, len(self.day_data) - 1)
-        row = self.day_data.iloc[t_idx]
-        yes_price = float(row["yes_price"])
-        no_price = float(row["no_price"])
-
-        # Mark-to-market using current mid prices
-        mtm_yes = self.position_yes * yes_price
-        mtm_no = self.position_no * no_price
-        return self.cash + mtm_yes + mtm_no
-
-    def _apply_action(self, action: int, yes_price: float, no_price: float):
-        """
-        Update positions & cash given the chosen action.
-        We apply a simple spread & fee model:
-
-        - buy price = mid * (1 + spread/2)
-        - sell price = mid * (1 - spread/2)
-        - fee_per_contract charged on notional each trade
-        """
-        spread = self.config.spread_bps
-        buy_yes_price = yes_price * (1.0 + spread / 2.0)
-        sell_yes_price = yes_price * (1.0 - spread / 2.0)
-        buy_no_price = no_price * (1.0 + spread / 2.0)
-        sell_no_price = no_price * (1.0 - spread / 2.0)
-
-        fee = self.config.fee_per_contract
-
-        if action == 1:  # Buy 1 YES
-            if self.position_yes < self.config.max_yes_position:
-                cost = buy_yes_price + fee
-                self.cash -= cost
-                self.position_yes += 1
-
-        elif action == 2:  # Sell 1 YES
-            if self.position_yes > -self.config.max_yes_position:
-                proceeds = sell_yes_price - fee
-                self.cash += proceeds
-                self.position_yes -= 1
-
-        elif action == 3:  # Buy 1 NO
-            if self.position_no < self.config.max_no_position:
-                cost = buy_no_price + fee
-                self.cash -= cost
-                self.position_no += 1
-
-        elif action == 4:  # Sell 1 NO
-            if self.position_no > -self.config.max_no_position:
-                proceeds = sell_no_price - fee
-                self.cash += proceeds
-                self.position_no -= 1
-
-        # action == 0 → do nothing
-
-    def _settle_contracts(self, outcome: int, yes_price: float, no_price: float):
-        """
-        Settle contracts at hour resolution.
-
-        Simplification: we assume all YES/NO positions are for the current hour
-        and are fully settled at the end of this step.
-
-        YES pays outcome * 1
-        NO  pays (1 - outcome) * 1
-        """
-        # Payout per contract
-        yes_payout = float(outcome)         # 1 if outcome=1 else 0
-        no_payout = float(1 - outcome)      # 1 if outcome=0 else 0
-
-        # Cash in payouts
-        self.cash += self.position_yes * yes_payout
-        self.cash += self.position_no * no_payout
-
-        # Clear positions for next hour
-        self.position_yes = 0
-        self.position_no = 0
+    def render(self):
+        # optional: implement later
+        pass
