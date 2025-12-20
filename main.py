@@ -8,7 +8,8 @@ from scripts.market_orders import create_orders
 
 
 def main():
-    train()
+    client = KalshiClient()
+    print(client.get_orders())
 
 
 if __name__ == "__main__":

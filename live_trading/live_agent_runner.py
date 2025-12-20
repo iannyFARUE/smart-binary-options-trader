@@ -1,4 +1,3 @@
-# live_trading/live_agent_runner.py
 import os
 import time
 import csv
@@ -11,304 +10,294 @@ from live_trading.kalshi_api import KalshiClient
 from env.kalshi_env import KalshiEnvConfig
 
 
-# ---------- helper: build observation vector for live trading ----------
+# ---------------------------
+# Helpers
+# ---------------------------
 
-def build_live_observation(
-    market: dict,
-    portfolio: dict,
-    config: KalshiEnvConfig,
-    btc_price: float,
-    btc_mean: float,
-    btc_std: float,
-):
+def norm_price_raw(raw, default=0.5):
+    if raw is None:
+        return default
+    try:
+        raw = float(raw)
+    except Exception:
+        return default
+    return raw / 100.0 if raw > 1.0 else raw
+
+
+def extract_market_obj(resp: dict) -> dict:
+    print(resp)
+    return resp.get("market", resp)
+
+
+def parse_iso_z(s: str):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def extract_times(m: dict):
+    close_time = parse_iso_z(m.get("close_time"))
+    expected_exp = parse_iso_z(m.get("expected_expiration_time"))
+    expiration = parse_iso_z(m.get("expiration_time"))
+    effective = close_time or expected_exp or expiration
+    return effective, close_time, expected_exp, expiration
+
+
+def is_resolved(status: str, result: str) -> bool:
+    if result in ("yes", "no"):
+        return True
+    if status in ("finalized", "resolved", "settled", "closed"):
+        return True
+    return False
+
+
+def extract_portfolio_cash(portfolio_resp: dict, fallback: float) -> float:
     """
-    Map live Kalshi BTC market + portfolio to the observation format used by PPO.
+    Kalshi demo often returns:
+      {"balance": 240273, ...}  # cents
+    or nested dicts in other modes.
 
-    In the training env, obs was:
-      [btc_norm, yes_price, no_price, hour_sin, hour_cos,
-       pos_yes, pos_no, cash_norm]
-
-    Here we'll approximate:
-      - pos_yes/pos_no from portfolio exposures in this market
-      - cash from portfolio 'cash' or 'available_funds'
-      - hour from market expiration or current time
+    Return cash in DOLLARS.
     """
-    # 1) BTC normalized
-    btc_norm = (btc_price - btc_mean) / (btc_std if btc_std > 0 else 1.0)
+    # Direct cash if present
+    if isinstance(portfolio_resp, dict) and portfolio_resp.get("cash") is not None:
+        return float(portfolio_resp["cash"])
 
-    # 2) YES/NO prices from the market orderbook/last trade
-    yes_price = float(market.get("yes_ask") or market.get("yes_price") or 0.5)
-    no_price = float(market.get("no_ask") or market.get("no_price") or (1.0 - yes_price))
+    # If balance is a number -> treat as cents
+    bal = portfolio_resp.get("balance") if isinstance(portfolio_resp, dict) else None
+    if isinstance(bal, (int, float)):
+        return float(bal) / 100.0
 
-    # 3) Time encoding: use market expiration hour in UTC
-    #    or fallback to current hour
-    expiry = market.get("expiration_time")
-    if expiry:
-        # assuming ISO 8601 string
-        try:
-            exp_dt = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
-            hour = exp_dt.hour
-        except Exception:
-            hour = datetime.now(timezone.utc).hour
+    # If balance is a dict -> try common keys
+    if isinstance(bal, dict):
+        for k in ("available_cash", "cash", "balance", "available_funds", "funds"):
+            v = bal.get(k)
+            if v is None:
+                continue
+            # if nested numeric assume cents unless it’s clearly already dollars
+            if isinstance(v, (int, float)):
+                # heuristic: big numbers are cents
+                return float(v) / 100.0 if v > 1000 else float(v)
+            # if it's a string like "2402.73"
+            try:
+                fv = float(v)
+                return fv / 100.0 if fv > 1000 else fv
+            except Exception:
+                pass
+
+    return float(fallback)
+
+
+def market_is_tradeable(market: dict) -> bool:
+    """
+    Detect empty Kalshi demo books.
+    """
+    yes_bid = market.get("yes_bid", 0)
+    yes_ask = market.get("yes_ask", 0)
+    no_bid = market.get("no_bid", 0)
+    no_ask = market.get("no_ask", 0)
+
+    # dead-book pattern seen in demo
+    if yes_bid == 0 and yes_ask == 0 and no_bid == 100 and no_ask == 100:
+        return False
+
+    has_yes = 0 < yes_bid < yes_ask < 100
+    has_no = 0 < no_bid < no_ask < 100
+    return has_yes or has_no
+
+
+def choose_fill_price(side: str, market: dict, fallback: float) -> float:
+    if side == "yes":
+        raw = market.get("yes_ask") or market.get("yes_bid")
     else:
-        hour = datetime.now(timezone.utc).hour
+        raw = market.get("no_ask") or market.get("no_bid")
+
+    p = norm_price_raw(raw, default=fallback)
+    return float(max(0.01, min(0.99, p)))
+
+
+def build_live_observation(market: dict, cash: float, config: KalshiEnvConfig):
+    yes_raw = market.get("yes_ask") or market.get("yes_bid")
+    no_raw = market.get("no_ask") or market.get("no_bid")
+
+    yes_p = norm_price_raw(yes_raw, default=0.5)
+    no_p = norm_price_raw(no_raw, default=(1.0 - yes_p))
+
+    yes_p = float(max(0.01, min(0.99, yes_p)))
+    no_p = float(max(0.01, min(0.99, no_p)))
+
+    effective_time, _, _, _ = extract_times(market)
+    hour = effective_time.hour if effective_time else datetime.now(timezone.utc).hour
 
     hour_rad = 2 * np.pi * hour / 24.0
-    hour_sin = np.sin(hour_rad)
-    hour_cos = np.cos(hour_rad)
-
-    # 4) Positions in this market from portfolio
-    #    For simplicity, we set pos_yes = net yes contracts, pos_no = net no contracts
-    pos_yes = 0.0
-    pos_no = 0.0
-    positions = portfolio.get("positions", [])
-    ticker = market["ticker"]
-    for pos in positions:
-        if pos.get("ticker") == ticker:
-            # Example fields: side ("yes" / "no"), count
-            side_pos = pos.get("side")
-            count = float(pos.get("count", 0))
-            if side_pos == "yes":
-                pos_yes += count
-            elif side_pos == "no":
-                pos_no += count
-
-    # 5) Cash normalized
-    cash = float(portfolio.get("cash", config.initial_cash))
-    cash_norm = cash / config.initial_cash
+    hour_sin = float(np.sin(hour_rad))
+    hour_cos = float(np.cos(hour_rad))
 
     obs = np.array(
         [
-            btc_norm,
-            yes_price,
-            no_price,
+            0.0,  # btc_norm (placeholder)
+            0.0,  # btc_ret
+            0.0,  # btc_vol
+            yes_p,
+            no_p,
             hour_sin,
             hour_cos,
-            pos_yes,
-            pos_no,
-            cash_norm,
+            0.0,  # inventory placeholder
+            cash / config.initial_cash,
         ],
         dtype=np.float32,
     )
+    return obs, yes_p, no_p
 
-    return obs
 
-
-# ---------- mapping PPO action -> Kalshi order side ----------
-
-def action_to_side_action(action: int):
-    """
-    Map PPO action (0..4) to (side, action) for Kalshi.
-
-    0: do nothing
-    1: buy  YES -> side="yes", action="buy"
-    2: sell YES -> side="yes", action="sell"
-    3: buy  NO  -> side="no",  action="buy"
-    4: sell NO  -> side="no",  action="sell"
-    """
+def action_to_order(action: int):
     if action == 1:
         return "yes", "buy"
-    elif action == 2:
-        return "yes", "sell"
-    elif action == 3:
+    if action == 2:
         return "no", "buy"
-    elif action == 4:
-        return "no", "sell"
-    else:
-        return "", ""  # do nothing
+    return "", ""
 
 
-# ---------- live loop ----------
+# ---------------------------
+# Main
+# ---------------------------
 
 def main():
-    # 1. Load PPO model
     model_path = "agent/models/ppo_kalshi_realdata.zip"
+
+    trade_log = "logs/live/kalshi_live_trades.csv"
+    resolution_log = "logs/live/kalshi_resolutions.csv"
+
+    os.makedirs("logs/live", exist_ok=True)
+
     model = PPO.load(model_path)
-
-    # 2. Set up Kalshi client
     client = KalshiClient()
-
-    # 3. Stats from training data for BTC normalization
-    #    For now, we hardcode; ideally compute from training events_df
-    #    You can later load these from a config or serialized file.
-    btc_mean = 20000.0
-    btc_std = 10000.0
-
     config = KalshiEnvConfig()
 
-    # 4. Live trading parameters
     contracts_per_trade = 1
-    poll_interval_sec = 60  # how often to check markets
-    log_path = "logs/live/kalshi_live_trades.csv"
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    poll_interval_sec = 60
 
-    # Create log file with header if not exists
-    if not os.path.exists(log_path):
-        with open(log_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                [
-                    "timestamp",
-                    "ticker",
-                    "btc_price",
-                    "yes_price",
-                    "no_price",
-                    "action",
-                    "side",
-                    "count",
-                    "price",
-                    "portfolio_value",
-                    "user_id",
-                    "order_id"
-                ]
-            )
+    if not os.path.exists(trade_log):
+        with open(trade_log, "w", newline="") as f:
+            csv.writer(f).writerow([
+                "timestamp",
+                "ticker",
+                "action_id",
+                "side",
+                "count",
+                "entry_price_prob",
+                "is_paper_fill",
+                "paper_reason",
+            ])
 
-    print("[live] Starting live demo loop (demo environment, no real money!)")
+    if not os.path.exists(resolution_log):
+        with open(resolution_log, "w", newline="") as f:
+            csv.writer(f).writerow([
+                "timestamp",
+                "ticker",
+                "status",
+                "result",
+            ])
+
+    watchlist = set()
+    resolved = set()
+
+    print("[live] Starting live demo loop (with paper-fill fallback).")
 
     while True:
         try:
-            # 1) Fetch BTC hourly markets (adjust filter to match actual ticker symbol)
-            markets_resp = client.get_markets(series_ticker="KXBTC",status="open",filter_liquid=True)
-            btc_markets = markets_resp.get("markets",[])
+            # ---- resolution scan ----
+            for tkr in list(watchlist):
+                if tkr in resolved:
+                    continue
 
-            # Filter for relevant BTC hourly threshold markets, adjust this filter
-            # btc_markets = [
-            #     m for m in markets
-            #     if "BTC" in m.get("underlying", "") or "BTC" in m.get("title", "")
-            # ]
+                m = extract_market_obj(client.get_market(tkr))
+                
+                status = m.get("status")
+                result = m.get("result")
 
-            if not btc_markets:
-                print("[live] No BTC markets found, sleeping...")
+                if is_resolved(status, result):
+                    print(f"[live] RESOLVED {tkr}: {result}")
+                    with open(resolution_log, "a", newline="") as f:
+                        csv.writer(f).writerow([
+                            datetime.now(timezone.utc).isoformat(),
+                            tkr,
+                            status,
+                            result,
+                        ])
+                    resolved.add(tkr)
+
+            # ---- get BTC markets ----
+            markets = client.get_markets(series_ticker="KXBTC", status="open").get("markets", [])
+
+            if not markets:
                 time.sleep(poll_interval_sec)
                 continue
 
-            print(btc_markets[:2])
-
-            # For now, just pick the next expiring BTC market
-            btc_markets.sort(key=lambda m: m.get("expiration_time", ""))
-            market = btc_markets[0]
+            markets.sort(key=lambda m: extract_times(m)[0] or datetime.max.replace(tzinfo=timezone.utc))
+            market = markets[0]
             ticker = market["ticker"]
-
-            # --- Normalize yes/no prices from Kalshi (0..100 cents) to 0..1 probabilities ---
-            def norm_price_raw(raw, default):
-                """
-                Convert raw Kalshi price (cents or 0-1) to float in [0,1].
-                If raw is None, use default.
-                """
-                if raw is None:
-                    return default
-
-                if isinstance(raw, str):
-                    raw = float(raw)
-
-                raw = float(raw)
-
-                # If > 1.0, treat as cents (0..100)
-                if raw > 1.0:
-                    return raw / 100.0
-
-                return raw
-
-
-            yes_raw = market.get("yes_ask", None) or market.get("yes_bid", None)
-            no_raw  = market.get("no_ask", None) or market.get("no_bid", None)
-
-            # First try to normalize from the book; if both are missing, fall back to 0.5 / 0.5
-            yes_price = norm_price_raw(yes_raw, default=0.5)
-            no_price  = norm_price_raw(no_raw, default=(1.0 - yes_price))
-
-            # Optional: clamp a bit to avoid exactly 0 or 1
-            yes_price = max(0.01, min(0.99, yes_price))
-            no_price  = max(0.01, min(0.99, no_price))
-
-            print("[DEBUG] normalized yes_price=", yes_price, "no_price=", no_price)
-            # crude proxy: treat 0.5 as at-the-money, but we don't know exact threshold here.
-            # For now, just treat btc_price as a dummy variable consistent with training scale:
-            btc_price = btc_mean + (yes_price - 0.5) * 2 * btc_std  # hacky but consistent scale
-
-            # 3) Get portfolio info
+           
             portfolio = client.get_portfolio()
-            # You might want to compute portfolio_value from cash + positions; here we log cash only
-            portfolio_value = float(portfolio.get("cash", config.initial_cash))
+            cash = extract_portfolio_cash(portfolio, config.initial_cash)
+            
 
-            # 4) Build observation
-            obs = build_live_observation(
-                market=market,
-                portfolio=portfolio,
-                config=config,
-                btc_price=btc_price,
-                btc_mean=btc_mean,
-                btc_std=btc_std,
-            )
+            obs, yes_p, no_p = build_live_observation(market, cash, config)
+            action_id, _ = model.predict(obs, deterministic=True)
+            action_id = int(action_id)
 
-            # 5) Ask PPO for action
-            action, _ = model.predict(obs, deterministic=True)
-            action = int(action)
-
-            side, act = action_to_side_action(action)
-
-            # If trying to sell with no position, override to "do nothing"
-            if act == "sell":
-                if side == "yes" and obs[-3] <= 0:
-                    print("[live] Agent wants to SELL YES but position_yes=0 -> skipping (no-op).")
-                    time.sleep(poll_interval_sec)
-                    continue
-                if side == "no" and obs[-2] <= 0:
-                    print("[live] Agent wants to SELL NO but position_no=0 -> skipping (no-op).")
-                    time.sleep(poll_interval_sec)
-                    continue
-            if side == "" or act == "":
-                print(f"[live] Action {action} -> do nothing this cycle.")
+            side, act = action_to_order(action_id)
+            if side == "":
+                print("[live] HOLD")
                 time.sleep(poll_interval_sec)
                 continue
 
-            # 6) Decide order price: we can place at current ask for simplicity
-                # Pick execution price
-            if side == "yes":
-                price = yes_price
-            else:
-                price = no_price
+            limit_price = yes_p if side == "yes" else no_p
+            limit_price = float(max(0.01, min(0.99, limit_price)))
 
-            print(
-                f"[live] Placing order: event={ticker}, market={ticker}, "
-                f"side={side}, action={act}, count={contracts_per_trade}, price={price:.3f}"
-            )
+            is_liquid = market_is_tradeable(market)
+            is_paper = not is_liquid
+            reason = "illiquid_demo_book" if is_paper else ""
 
-            order_resp = client.create_order(
-                ticker=ticker,
-                side=side,
-                action=act,
-                count=contracts_per_trade,
-                price=price,
-            )
-            print("[live] Order response:", order_resp)
-            print(order_resp.keys())
+            if not is_paper:
+                try:
+                    client.create_order(
+                        ticker=ticker,
+                        side=side,
+                        action="buy",
+                        count=contracts_per_trade,
+                        price=limit_price,
+                    )
+                    print(f"[live] LIVE BUY {side.upper()} {ticker} @ {limit_price:.3f}")
+                except Exception as e:
+                    print("[live] LIVE FAILED → paperfill", e)
+                    is_paper = True
+                    reason = "live_failed"
 
-            # 8) Log to CSV
-            with open(log_path, "a", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(
-                    [
-                        datetime.now(timezone.utc).isoformat(),
-                        ticker,
-                        btc_price,
-                        yes_price,
-                        no_price,
-                        order_resp["order"]["action"],
-                        side,
-                        contracts_per_trade,
-                        price,
-                        portfolio_value,
-                        order_resp["order"]["user_id"],
-                        order_resp["order"]["order_id"]
-                    ]
-                )
+            if is_paper:
+                limit_price = choose_fill_price(side, market, limit_price)
+                print(f"[live] PAPERFILL BUY {side.upper()} {ticker} @ {limit_price:.3f}")
 
-            # 9) Sleep until next poll
+            with open(trade_log, "a", newline="") as f:
+                csv.writer(f).writerow([
+                    datetime.now(timezone.utc).isoformat(),
+                    ticker,
+                    action_id,
+                    side,
+                    contracts_per_trade,
+                    limit_price,
+                    int(is_paper),
+                    reason,
+                ])
+
+            watchlist.add(ticker)
             time.sleep(poll_interval_sec)
 
         except KeyboardInterrupt:
-            print("\n[live] Stopping live loop (KeyboardInterrupt).")
+            print("[live] Stopped.")
             break
         except Exception as e:
             print("[live] ERROR:", e)

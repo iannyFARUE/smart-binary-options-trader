@@ -145,6 +145,7 @@ class KalshiClient:
         """
         GET /markets/{ticker}
         """
+        print("here ",)
         return self._request("GET", f"/trade-api/v2/markets/{ticker}")
     
     @staticmethod
@@ -215,7 +216,7 @@ class KalshiClient:
         """
         GET /orders
         """
-        return self._request("GET", "/trade-api/v2/orders", params=params)
+        return self._request("GET", "/trade-api/v2/portfolio/orders", params=params)
 
     def create_order(
         self,

@@ -1,119 +1,218 @@
-# live_trading/analyze_live_results.py
-import csv
-from datetime import datetime
+# agent/analyze_live_results.py
+import os
+import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import os
 
 
-LOG_PATH = "logs/live/kalshi_live_trades.csv"
-OUT_DIR = "reports/figs"
-INITIAL_CASH = 10_000.0  # same as KalshiEnvConfig.initial_cash
+TRADES_CSV = "logs/live/kalshi_live_trades.csv"
+RESOLUTIONS_CSV = "logs/live/kalshi_resolutions.csv"
+OUTCOMES_CSV = "logs/live/live_trade_outcomes.csv"
+FIG_DIR = "reports/figs"
 
 
-def load_live_trades(log_path=LOG_PATH):
-    timestamps = []
-    tickers = []
-    actions = []
-    sides = []
-    prices = []
-    cash_snapshots = []
-
-    with open(log_path, "r") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            # we logged these columns earlier:
-            # timestamp, event_ticker, market_ticker, btc_price_proxy,
-            # yes_price, no_price, action, side, count, price, portfolio_cash
-            timestamps.append(datetime.fromisoformat(row["timestamp"]))
-            tickers.append(row["ticker"])
-            actions.append(row["action"])
-            sides.append(row["side"])
-            prices.append(float(row["price"]))
-            cash_snapshots.append(float(row["portfolio_value"]))
-
-    return {
-        "timestamps": np.array(timestamps),
-        "tickers": np.array(tickers),
-        "actions": np.array(actions),
-        "sides": np.array(sides),
-        "prices": np.array(prices),
-        "cash": np.array(cash_snapshots),
-    }
+def _ensure_dirs():
+    os.makedirs(os.path.dirname(OUTCOMES_CSV), exist_ok=True)
+    os.makedirs(FIG_DIR, exist_ok=True)
 
 
-def compute_equity_series(cash_array):
+def _load_csv(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing file: {path}")
+    df = pd.read_csv(path)
+    return df
+
+
+def compute_trade_outcomes(trades: pd.DataFrame, resolutions: pd.DataFrame) -> pd.DataFrame:
     """
-    For now we approximate equity by portfolio_cash snapshots.
-    If you later log full portfolio value (cash + mark-to-market),
-    replace this with that field instead.
+    Approx PnL model (per contract):
+      - If you BUY YES at price p (prob in [0,1]):
+          payout = 1 if result == "yes" else 0
+          pnl_per_contract = payout - p
+      - If you BUY NO at price p_no:
+          payout = 1 if result == "no" else 0
+          pnl_per_contract = payout - p_no
+
+    We use 'limit_price_prob' as entry price (best available in your logs).
     """
-    return cash_array
+    # Normalize timestamps
+    trades["timestamp"] = pd.to_datetime(trades["timestamp"], utc=True, errors="coerce")
+    resolutions["timestamp"] = pd.to_datetime(resolutions["timestamp"], utc=True, errors="coerce")
+
+    # Normalize result/status columns
+    # resolutions has: ticker, status, result, expiration_time (or effective time in newer version)
+    resolutions["result"] = resolutions["result"].astype(str).str.lower()
+
+    # Join on ticker (many trades can exist per ticker; keep the first trade unless you want FIFO)
+    # We'll keep ALL trades and attach the same resolution result to each trade of that ticker.
+    merged = trades.merge(
+        resolutions[["ticker", "result", "status", "expiration_time"]].drop_duplicates("ticker"),
+        on="ticker",
+        how="left",
+        suffixes=("", "_res"),
+    )
+
+    # Ensure numeric
+    merged["count"] = pd.to_numeric(merged.get("count", 1), errors="coerce").fillna(1).astype(int)
+    merged["limit_price_prob"] = pd.to_numeric(merged["limit_price_prob"], errors="coerce")
+    merged["portfolio_cash"] = pd.to_numeric(merged.get("portfolio_cash", np.nan), errors="coerce")
+
+    # Determine side & entry price
+    merged["side"] = merged["side"].astype(str).str.lower()
+    merged["result"] = merged["result"].astype(str).str.lower()
+
+    # payout
+    merged["payout_per_contract"] = np.where(
+        (merged["side"] == "yes") & (merged["result"] == "yes"),
+        1.0,
+        np.where(
+            (merged["side"] == "no") & (merged["result"] == "no"),
+            1.0,
+            np.where(merged["result"].isin(["yes", "no"]), 0.0, np.nan),
+        ),
+    )
+
+    merged["pnl_per_contract"] = merged["payout_per_contract"] - merged["limit_price_prob"]
+    merged["pnl"] = merged["pnl_per_contract"] * merged["count"]
+
+    merged["resolved"] = merged["result"].isin(["yes", "no"])
+    merged["won"] = np.where(merged["resolved"], merged["pnl_per_contract"] > 0, np.nan)
+
+    # Day buckets
+    merged["trade_day"] = merged["timestamp"].dt.floor("D")
+
+    # Order columns nicely
+    cols = [
+        "timestamp",
+        "trade_day",
+        "ticker",
+        "action_id",
+        "side",
+        "count",
+        "limit_price_prob",
+        "result",
+        "status",
+        "payout_per_contract",
+        "pnl_per_contract",
+        "pnl",
+        "resolved",
+        "won",
+    ]
+    existing = [c for c in cols if c in merged.columns]
+    return merged[existing].sort_values("timestamp")
+
+
+def print_summary(outcomes: pd.DataFrame):
+    total = len(outcomes)
+    resolved = outcomes["resolved"].sum() if "resolved" in outcomes else 0
+    unresolved = total - resolved
+
+    print("\n=== LIVE SUMMARY ===")
+    print(f"Trades logged: {total}")
+    print(f"Resolved trades: {resolved}")
+    print(f"Unresolved trades: {unresolved}")
+
+    if resolved == 0:
+        print("No resolved trades yet — run longer or ensure resolution logging includes status='finalized'.")
+        return
+
+    res = outcomes[outcomes["resolved"]].copy()
+    total_pnl = float(res["pnl"].sum())
+    mean_pnl = float(res["pnl"].mean())
+    win_rate = float((res["pnl"] > 0).mean())
+
+    print(f"\nTotal PnL (approx): {total_pnl:.4f}")
+    print(f"Mean PnL per trade: {mean_pnl:.4f}")
+    print(f"Win rate: {win_rate*100:.1f}%")
+
+    # by side
+    for side in ["yes", "no"]:
+        s = res[res["side"] == side]
+        if len(s) == 0:
+            continue
+        print(f"\nSide={side.upper()}: n={len(s)} | mean pnl={s['pnl'].mean():.4f} | win rate={(s['pnl']>0).mean()*100:.1f}%")
+
+    # daily
+    daily = res.groupby("trade_day")["pnl"].sum()
+    print("\nDaily PnL:")
+    for day, val in daily.items():
+        print(f"  {day.date()}: {val:.4f}")
+
+
+def make_plots(outcomes: pd.DataFrame):
+    resolved = outcomes[outcomes["resolved"]].copy()
+    if len(resolved) == 0:
+        return
+
+    # cumulative pnl by time
+    resolved = resolved.sort_values("timestamp")
+    resolved["cum_pnl"] = resolved["pnl"].cumsum()
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(resolved["timestamp"], resolved["cum_pnl"])
+    plt.title("Live Cumulative PnL (approx)")
+    plt.xlabel("Time")
+    plt.ylabel("Cumulative PnL ($)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_DIR, "live_cum_pnl.png"))
+    plt.close()
+
+    # daily pnl bar
+    daily = resolved.groupby("trade_day")["pnl"].sum().reset_index()
+    plt.figure(figsize=(10, 5))
+    plt.bar(daily["trade_day"].astype(str), daily["pnl"])
+    plt.title("Live Daily PnL (approx)")
+    plt.xlabel("Day")
+    plt.ylabel("PnL ($)")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_DIR, "live_daily_pnl.png"))
+    plt.close()
+
+    # pnl histogram
+    plt.figure(figsize=(8, 4))
+    plt.hist(resolved["pnl"], bins=20)
+    plt.title("Live Trade PnL Histogram (approx)")
+    plt.xlabel("PnL ($)")
+    plt.ylabel("Count")
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_DIR, "live_trade_pnl_hist.png"))
+    plt.close()
+
+    # win rate over time (rolling)
+    resolved["win"] = (resolved["pnl"] > 0).astype(int)
+    window = min(20, len(resolved))
+    if window >= 5:
+        resolved["roll_win"] = resolved["win"].rolling(window).mean()
+        plt.figure(figsize=(10, 4))
+        plt.plot(resolved["timestamp"], resolved["roll_win"])
+        plt.ylim(0, 1)
+        plt.title(f"Rolling Win Rate (window={window})")
+        plt.xlabel("Time")
+        plt.ylabel("Win rate")
+        plt.tight_layout()
+        plt.savefig(os.path.join(FIG_DIR, "live_rolling_winrate.png"))
+        plt.close()
 
 
 def main():
-    if not os.path.exists(LOG_PATH):
-        print(f"No live log found at {LOG_PATH}")
-        return
+    _ensure_dirs()
 
-    data = load_live_trades(LOG_PATH)
-    ts = data["timestamps"]
-    cash = data["cash"]
+    trades = _load_csv(TRADES_CSV)
+    resolutions = _load_csv(RESOLUTIONS_CSV)
 
-    if len(cash) == 0:
-        print("No trades logged yet.")
-        return
+    outcomes = compute_trade_outcomes(trades, resolutions)
+    outcomes.to_csv(OUTCOMES_CSV, index=False)
 
-    equity = compute_equity_series(cash)
-    pnl = equity - INITIAL_CASH
-    returns = pnl / INITIAL_CASH
+    print_summary(outcomes)
+    make_plots(outcomes)
 
-    mean_pnl = pnl.mean()
-    std_pnl = pnl.std()
-    mean_ret = returns.mean()
-    std_ret = returns.std()
-    sharpe = mean_ret / std_ret if std_ret > 1e-8 else np.nan
-
-    print("\n=== LIVE TRADING RESULTS ===")
-    print(f"Number of logged trades: {len(equity)}")
-    print(f"Final equity: {equity[-1]:.2f} $")
-    print(f"Total PnL: {pnl[-1]:.2f} $")
-    print(f"Mean PnL per trade snapshot: {mean_pnl:.4f} $")
-    print(f"Std PnL: {std_pnl:.4f} $")
-    print(f"Mean return: {mean_ret:.6f}")
-    print(f"Std return: {std_ret:.6f}")
-    print(f"Approx. Sharpe (per snapshot): {sharpe:.3f}")
-
-    os.makedirs(OUT_DIR, exist_ok=True)
-
-    # Plot equity over time
-    plt.figure(figsize=(10, 5))
-    plt.plot(ts, equity, marker="o", linestyle="-")
-    plt.axhline(INITIAL_CASH, linestyle="--", linewidth=1, label="Initial cash")
-    plt.xlabel("Time")
-    plt.ylabel("Equity ($)")
-    plt.title("Live Demo Trading: Equity Over Time")
-    plt.legend()
-    plt.tight_layout()
-    equity_path = os.path.join(OUT_DIR, "live_equity_curve.png")
-    plt.savefig(equity_path)
-    plt.close()
-
-    # Histogram of per-step changes in cash
-    deltas = np.diff(equity)
-    plt.figure(figsize=(8, 5))
-    plt.hist(deltas, bins=20)
-    plt.xlabel("ΔCash between logged points ($)")
-    plt.ylabel("Frequency")
-    plt.title("Live Demo Trading: Distribution of Cash Changes")
-    plt.tight_layout()
-    hist_path = os.path.join(OUT_DIR, "live_pnl_histogram.png")
-    plt.savefig(hist_path)
-    plt.close()
-
-    print("\nSaved figures:")
-    print("  -", equity_path)
-    print("  -", hist_path)
+    print("\nSaved:")
+    print(f"  {OUTCOMES_CSV}")
+    print(f"  {os.path.join(FIG_DIR, 'live_cum_pnl.png')}")
+    print(f"  {os.path.join(FIG_DIR, 'live_daily_pnl.png')}")
+    print(f"  {os.path.join(FIG_DIR, 'live_trade_pnl_hist.png')}")
+    print(f"  {os.path.join(FIG_DIR, 'live_rolling_winrate.png')}")
 
 
 if __name__ == "__main__":
